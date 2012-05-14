@@ -1,0 +1,424 @@
+#!/usr/bin/env node
+
+/**
+ * Dependencies
+ */
+
+var program = require('commander')
+  , fs = require('fs')
+  , path = require('path')
+  , exec = require('child_process').exec
+  , sh = require('shelljs')
+  , url = require('url')
+  , serve = require('../lib/serve')
+  , config = require('../lib/config')
+;
+
+var client = require('mdoq')
+  .use(function (req, res, next, use) {
+    var host = url.parse(this.url).host
+      , key = keys(host);
+
+    if(key) {
+      // finish with http
+      use(require('mdoq-http'));
+      req.headers['x-dssh-key'] = key;
+      next();
+    } else {
+      if(~this.url.indexOf('.deploydapp.com')) {
+         login(host, next);
+      } else {
+        // dont bother going to http without a key
+        return next({message: 'couldnt find a key for that remote'});
+      }
+
+      // after everyone has a chance to grab a key
+      use(function (req, res, next) {
+        key = keys(host);
+        req.headers['x-dssh-key'] = key;
+        next();
+      });
+      // finish with http
+      use(require('mdoq-http'));
+    }
+  })
+;
+
+/**
+ * Utilities
+ */
+
+function getAppName() {
+  return path.basename(path.resolve('.'));
+}
+
+function getStorageUrl(port) {
+  port = port || config('mongod').port;
+  return 'mongodb://localhost:' + (port || 27017) + '/' + getAppName();
+}
+
+function cancel(msg) {
+  console.log(msg);
+  // process.exit(process.pid);
+}
+
+function userConfig(key, value) {
+  return config(key, value, process.env.HOME + '/.dpd');
+}
+
+function sanitizeHost(host) {
+  if(~host.indexOf('://')) {
+    return host;
+  } else {
+    return 'http://' + host;
+  }
+}
+
+function pushTo(dpd, fn) {
+  var l = loader(fn);
+  
+  files().forEach(function (file) {
+    if(fs.statSync(file).isDirectory()) {
+      l.add();
+      uploadDir(file, dpd, function () {
+        l.tic();
+      });
+    }
+  })
+}
+
+function files(fn) {
+  var files = sh.find('.').filter(function(file) { return file[0] !== '.'; });
+  files.push('.');
+  return files;
+}
+
+function login(host, next) {
+  console.log('please login to deployd.com');
+  program.prompt('username: ', function (username) {
+    program.password('password: ', '*', function (password) {
+      require('mdoq')
+        .require('mdoq-http')
+        .use('http://deployd.com/apps/authenticate')
+        .get({host: host})
+        .post({username: username, password: password}, function (err, app) {
+          if(app && app.key) {
+            keys(host, app.key);
+            addRemote(host);
+            next();
+          } else {
+            next({message: 'login failed...'});
+          }
+        })
+    })
+  })
+}
+
+function resources(dpd, fn) {
+  dpd
+    .use('/resources')
+    .get(function (err, resources) {
+      if(err) {
+        console.log(err);
+        cancel('an error occurred while fetching resources');
+      } else if(!resources) {
+        console.log(dpd.url, 'does not have any resources');
+        process.exit();
+      } else {
+        resources.forEach(fn);
+      }
+    });
+}
+
+function keys(host, key) {
+  var keys = config('keys') || {};
+  if(key) {
+    keys[host] = key;
+    config('keys', keys);
+  } else {
+    return keys[host];
+  }
+}
+
+function addRemote(host, name) {
+  if(!host) return cancel('host is required');
+  var remotes = config('remotes') || {};
+  remotes[host] = name || true;
+  config('remotes', remotes);
+}
+
+function uploadFile(file, dpd, fn) {
+  var url = file;
+  
+  if(url[0] === '.') url = url.slice(1);
+  if(url[0] !== '/') url = '/' + url;
+
+  dpd.use(url).post(fs.createReadStream(file), fn);
+}
+
+function uploadDir(dir, dpd, fn) {
+  var l = loader(fn);
+  
+  function upload() {
+    fs.readdirSync(dir).forEach(function (file) {
+      var filePath = dir + '/' + file;
+
+      if(fs.statSync(filePath).isFile() && file[0] != '.') {
+        l.add();
+        uploadFile(filePath, dpd, l.tic);
+      }
+    })
+    
+    if(!l.total) l.end();
+  }
+  
+  var urlPath = '/' + dir;
+  if(dir === '.') urlPath = '/';
+  
+  var resources = dpd.use('/resources');
+  
+  resources.get({path: urlPath}, function (err, res) {
+    if(err) return cancel(err);
+    
+    if(res) {
+      upload();
+    } else {
+      // create the resource
+      resources.post({path: urlPath, typeLabel: 'Files', type: 'Static'}, upload);
+    }
+  })
+}
+
+function downloadFile(host, path, output, fn) {
+  require('mdoq')
+    .require('mdoq-http')
+    .use(sanitizeHost(host))
+    .use(path)
+    .pipe(fs.createWriteStream(output), fn)
+  ;
+}
+
+function downloadFiles(host, resource, fn) {
+  var remaining = 0;
+  
+  var l = loader(fn);
+  
+  client.use(sanitizeHost(host)).use(resource.path).get(function (err, files) {
+    if(err || !files) return cancel(err);
+    if(resource.path === '/') resource.path = '';
+    else sh.mkdir('-p', '.' + resource.path);
+    
+    files.forEach(function (file) {
+      l.add();
+      downloadFile(host, resource.path + '/' + file, '.' + resource.path + '/' + file, function () {
+        l.tic();
+      });
+    })
+  })
+}
+
+function pull(host, fn) {
+  var l = loader(fn);
+  
+  resources(client.use(sanitizeHost(host)), function (resource) {
+    if(resource.type === 'Static') {
+      l.add();
+      downloadFiles(host, resource, l.tic);
+    }
+  });
+}
+
+/**
+ * Async Loader Utility
+ */
+
+var loaders = [];
+var lbl = '';
+function loader(fn) {
+  var l = {
+    completed: 0,
+    total: 0,
+    tic: function (force) {
+      l.completed++;
+      
+      if(force) l.completed = l.total;
+      
+      // render all loaders state...
+      var allTotal = 0, allCompleted = 0;
+      loaders.forEach(function (loader) {
+        allTotal += loader.total;
+        allCompleted += loader.completed;
+      });
+      
+      if(allCompleted === allTotal) loaders = [];
+      var p = allCompleted / allTotal;
+      var perc = Math.round(p * 100);
+      var bar = '';
+      
+      while(bar.length < 20) {
+        if(bar.length < p * 20) bar += '=';
+        else bar += ' ';
+      }
+      
+      if(allTotal > 0) {
+        process.stdout.write('\r\033[2K' + '[' + bar + '] ' + allCompleted + '/' + allTotal + ' ');
+      }
+      if(perc === 100) console.log('');
+
+      if(l.completed === l.total) fn();
+    },
+    add: function () {
+      l.total++;
+    },
+    end: function () {
+      l.tic(true);
+    }
+  }
+  
+  loaders.push(l);
+  return l;
+}
+
+/**
+ * CLI Options
+ */
+ 
+program
+  .version(JSON.parse(fs.readFileSync(__dirname + '/../package.json')).version)
+;
+
+/**
+ * CLI Commands
+ */
+
+program
+  .command('clone [host]')
+  .description(' - add a remote host and pull down all its files into a new directory')
+  .action(function (host) {
+    // if(config('clone')) return cancel('cannot clone into an existing clone!');
+    var name = url.parse(sanitizeHost(host)).host.split('.')[0].split(':')[0];
+    console.log('cloning into', name + '...');
+    sh.mkdir('-p', name);
+    sh.cd(name);
+    
+    addRemote(host);
+
+    pull(host, function () {
+      config('clone', host);
+      process.exit();
+    })
+  })
+;
+
+program
+  .command('pull [host]')
+  .description(' - pull down remote files into the current directory')
+  .action(function (host) {
+
+    function use(host) {
+      if(!host) return cancel('no remote found! add one with `dpd remote` or specify one `dpd push myapp.com`');
+      pull(host, function () {
+        process.exit();
+      })
+    }
+    
+    var remotes = config('remotes') || {};
+    if(host) {
+      use(host);
+    } else if(Object.keys(remotes).length > 1) {
+      console.log('more than one remote found... you must specify one of the following hosts');
+      program.choose(Object.keys(remotes), function (i) {
+        use(Object.keys(remotes)[i]);
+      });
+    } else {
+      use(Object.keys(remotes)[0]);
+    }
+  })
+;
+
+program
+  .command('push [host]')
+  .description(' - push all local files to a remote host')
+  .action(function (host) {
+    function use(host) {
+      if(!host) return cancel('no remote found! add one with `dpd remote` or specify one `dpd push myapp.com`');
+      
+      var l = loader(function () {
+        console.log(host, 'is now up to date');
+      });
+      
+      var remote = client.use(sanitizeHost(host));
+      
+      l.add();
+      pushTo(remote, function () {
+        l.tic();
+      });
+    }
+    
+    var remotes = config('remotes') || {};
+    if(host) {
+      use(host);
+    } else if(Object.keys(remotes).length > 1) {
+      console.log('more than one remote found... you must specify one of the following hosts');
+      program.choose(Object.keys(remotes), function (i) {
+        use(Object.keys(remotes)[i]);
+      });
+    } else {
+      use(Object.keys(remotes)[0]);
+    }
+  })
+;
+
+function dev(port) {
+  port = port || 3000;
+  
+  function start() {
+    console.log('dev server running on port', port);
+    console.log('serving files from', path.resolve('.'));
+  }
+  
+  if(config('clone')) {
+    serve('.', port, start);
+  } else {
+    program.prompt("enter the remote deployd host: ", function (url) {
+      if(url) {
+        config('clone', sanitizeHost(url));
+        serve('.', port, start);
+      }
+    })
+  }
+}
+
+program
+  .command('dev [port]')
+  .description(' - boot an http server to serve files of the current directory as well as proxy requests to a remote instance')
+  .action(dev)
+;
+
+program
+  .command('remote [host]')
+  .description(' - set the remote host')
+  .action(function (host) {
+    if(host) {
+      config('clone', host);
+    }
+  })
+;
+
+program
+  .command('config [key] [value]')
+  .description(' - (value is optional) get or set a config value')
+  .action(function (key, value) {
+    console.log(config(key, value));
+  })
+;
+
+/**
+ * Parse arguments
+ */
+
+program.parse(process.argv);
+
+if(program.args.length === 0) {
+  dev();
+}

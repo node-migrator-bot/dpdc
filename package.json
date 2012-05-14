@@ -1,0 +1,32 @@
+{
+  "author": "Ritchie Martori <ritchie@deployd.com> (deployd.com)",
+  "name": "dpdc",
+  "description": "client lib for deployd server",
+  "version": "0.0.1",
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/deployd/dpdc.git"
+  },
+  "main": "index.js",
+  "engines": {
+    "node": ">= 0.6.0"
+  },
+  "dependencies": {
+    "mdoq": "0.9.0",
+    "mdoq-http": "0.5.x",
+    "shelljs": "*",
+    "commander": "0.5.x",
+    "request": "2.9.x",
+    "filed": "0.0.x"
+  },
+  "devDependencies": {
+    "mocha": "*",
+    "chai": "*",
+    "node-markdown": "*",
+    "deployd": "*"
+  },
+  "optionalDependencies": {},
+  "bin": {
+    "dpdc": "./bin/dpdc"
+  }
+}
