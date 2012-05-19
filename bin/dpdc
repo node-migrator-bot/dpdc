@@ -401,6 +401,7 @@ program
   .action(function (host) {
     if(host) {
       config('clone', host);
+      addRemote(host);
     }
   })
 ;
